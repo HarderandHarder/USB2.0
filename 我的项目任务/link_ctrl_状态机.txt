@@ -1,0 +1,91 @@
+// ==========================================================
+    // FSM State Definitions
+    // ==========================================================
+    localparam S_IDLE        = 4'd0;  // 空闲：监听总线
+    localparam S_RX_PROCESS  = 4'd1;  // 接收中：正在解包
+    localparam S_RX_CHECK    = 4'd2;  // 接收校验：EOP后检查CRC
+    
+    localparam S_TX_REQ      = 4'd3;  // 发送请求：仲裁上层请求
+    localparam S_TX_PREPARE  = 4'd4;  // 发送准备：拉高 d_oe，等待PHY Ready
+    localparam S_TX_SEND     = 4'd5;  // 发送中：驱动 control_t 吐数据
+    localparam S_WAIT_ACK    = 4'd6;  // 等待握手：发完数据包，等接收方回ACK
+    
+    reg [3:0] state, next_state;
+
+    // ==========================================================
+    // 状态跳转逻辑 (Combinational Logic)
+    // ==========================================================
+    always @(*) begin
+        next_state = state;
+        case (state)
+            S_IDLE: begin
+                // 优先级：接收(RX) > 发送(TX)
+                // 如果 PHY 说有数据来了 (rx_lp_valid/sop)，立即接收
+                if (rx_pkt_valid_pulse || rx_sop_detected) 
+                    next_state = S_RX_PROCESS;
+                // 否则，如果上层要发数据，且线路空闲
+                else if (tx_req_valid) 
+                    next_state = S_TX_REQ;
+            end
+
+            S_RX_PROCESS: begin
+                // 一直等到接收结束 (EOP)
+                if (rx_done_pulse) 
+                    next_state = S_RX_CHECK;
+            end
+
+            S_RX_CHECK: begin
+                // 在这里判断 CRC 是否正确，决定是否要回发 handshake
+                // 简化版：回到 IDLE
+                next_state = S_IDLE;
+            end
+
+            S_TX_REQ: begin
+                // 确认要发送，跳转准备状态
+                next_state = S_TX_PREPARE;
+            end
+
+            S_TX_PREPARE: begin
+                // 这里通常需要几个周期的 Turnaround Time
+                // 拉高 d_oe
+                next_state = S_TX_SEND;
+            end
+
+            S_TX_SEND: begin
+                // 等待 control_t 模块反馈 "done"
+                if (tx_done) begin
+                    // 如果发的是数据包，需要等对方回 ACK
+                    if (is_data_packet) next_state = S_WAIT_ACK;
+                    else next_state = S_IDLE;
+                end
+            end
+
+            S_WAIT_ACK: begin
+                // 等待超时或收到ACK
+                if (time_out || ack_received) 
+                    next_state = S_IDLE;
+            end
+            
+            default: next_state = S_IDLE;
+        endcase
+    end
+
+    // ==========================================================
+    // 输出逻辑 (Output Logic) - 关键！
+    // ==========================================================
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            d_oe <= 1'b0; // 复位必须为输入模式
+            tx_start <= 1'b0;
+        end else begin
+            case (next_state) // 推荐用 next_state 预判输出以满足时序
+                S_TX_PREPARE, S_TX_SEND: 
+                    d_oe <= 1'b1; // 只有在这两个状态，我们要驱动总线
+                default: 
+                    d_oe <= 1'b0; // 其他时候统统高阻态(High-Z)听别人说
+            endcase
+            
+            // 控制子模块信号
+            tx_start <= (next_state == S_TX_SEND) && (state != S_TX_SEND);
+        end
+    end
